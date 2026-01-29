@@ -1,3 +1,6 @@
 .env
 .env.example
 /dbt/logs
+__pycache__
+data/*
+state/*
