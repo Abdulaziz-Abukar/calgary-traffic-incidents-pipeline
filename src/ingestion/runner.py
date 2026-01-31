@@ -3,16 +3,15 @@ import argparse
 from pathlib import Path
 import json
 import requests
-import uuid
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 
 from .socrata_models import TrafficIncidentRow
 from .mappers import IngestionMeta, to_bronze_row
-from ..utils.time_utils import month_bounds
-from ..storage.bq_loader import load_jsonl_to_bq
-from ..utils.make_snapshot_id import make_snapshot_id
+from utils.time_utils import month_bounds
+from storage.bq_loader import load_jsonl_to_bq
+from utils.make_snapshot_id import make_snapshot_id
 
 load_dotenv()
 
