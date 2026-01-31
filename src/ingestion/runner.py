@@ -1,14 +1,17 @@
 import os
 import argparse
+from pathlib import Path
 import json
 import requests
+import uuid
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 
-from.socrata_models import TrafficIncidentRow
+from .socrata_models import TrafficIncidentRow
 from .mappers import IngestionMeta, to_bronze_row
 from ..utils.time_utils import month_bounds
+from ..storage.bq_loader import load_jsonl_to_bq
 
 load_dotenv()
 
@@ -34,10 +37,8 @@ def parse_args() -> argparse.Namespace:
     incremental.add_argument('--since', required=False, help='ISO datetime... (optional if watermark exists)')
     incremental.add_argument('--page-size', type=int, required=True)
     incremental.add_argument('--max-pages', type=int, required=True)
-    incremental.add_argument('--snapshot_id', type=str, required=True)
-    incremental.add_argument('--run_type', type=str, required=True)
-    incremental.add_argument('--query_name', type=str, required=True)
     incremental.add_argument('--out', required=True)
+    incremental.add_argument('--load-to-bq', action="store_true")
 
     
     # Backfill pulls
@@ -46,10 +47,8 @@ def parse_args() -> argparse.Namespace:
     backfill.add_argument('--month', required=True, help='YYYY-MM, e.g. 2025-12')
     backfill.add_argument('--page-size', type=int, required=True)
     backfill.add_argument('--max-pages', type=int, required=True)
-    backfill.add_argument('--snapshot_id', type=str, required=True)
-    backfill.add_argument('--run_type', type=str, required=True)
-    backfill.add_argument('--query_name', type=str, required=True)
     backfill.add_argument('--out', required=True)
+    backfill.add_argument('--load-to-bq', action="store_true")
 
     return parser.parse_args()
 
@@ -115,8 +114,6 @@ def _pull_pages_to_ndjson(
         out_path: str,
 ) -> datetime | None:
     
-    max_source_updated_at: datetime | None = None
-
     headers = _build_headers()
 
     page_count = 0
@@ -124,6 +121,10 @@ def _pull_pages_to_ndjson(
     total_rows = 0
     distinct_incidents: set[str] = set()
     max_source_updated_at: datetime | None = None
+
+
+    out_dir = os.path.dirname(out_path) or "."
+    os.makedirs(out_dir, exist_ok=True)
 
     with open(out_path, 'w', encoding='utf-8') as f:
         while page_count < max_pages:
@@ -166,12 +167,9 @@ def _pull_pages_to_ndjson(
                     distinct_incidents.add(str(incident_id))
                 
 
-                # watermark handler
-                updated = (
-                    bronze.get("source_updated_at")
-                    or bronze.get("socrata_updated_at")
-                    or bronze.get("socrata_updated_at".replace("socrata_", "source_"))  # harmless fallback
-                )
+                
+                updated = bronze.get("source_updated_at")
+
 
                 if updated is not None:
                     if isinstance(updated, str):
@@ -194,7 +192,7 @@ def _pull_pages_to_ndjson(
     
     print("\n=== Pull Summary ===")
     print(f"Pages pulled:                       {page_count}")
-    print(f"Rows written:                       {page_count}")
+    print(f"Rows written:                       {total_rows}")
     print(f"Distinct incident_id:               {len(distinct_incidents)}")
 
     return max_source_updated_at
@@ -208,11 +206,10 @@ def incremental(
         since: datetime,
         page_size: int,
         max_pages: int,
-        snapshot_id: str,
-        run_type: str,
-        query_name: str,
         out_path: str,
 ) -> None:
+    snapshot_id = str(uuid.uuid4())
+
     since_str = _iso_z(since)
 
     soql = (
@@ -224,8 +221,8 @@ def incremental(
     meta = IngestionMeta(
         snapshot_id=snapshot_id,
         snapshot_ts=datetime.now(timezone.utc),
-        run_type=run_type,
-        query_name=query_name,
+        run_type="daily",
+        query_name="incremental",
     )
 
     new_max = _pull_pages_to_ndjson(
@@ -249,11 +246,10 @@ def backfill(
         month: str,
         page_size: int,
         max_pages: int,
-        snapshot_id: str,
-        run_type: str,
-        query_name: str,
         out_path: str,
 ) -> None:
+    snapshot_id = str(uuid.uuid4())
+
     start_dt, end_dt = month_bounds(month)
     start_date = _iso_floating(start_dt)
     end_date = _iso_floating(end_dt)
@@ -268,8 +264,8 @@ def backfill(
     meta = IngestionMeta(
         snapshot_id=snapshot_id,
         snapshot_ts=datetime.now(timezone.utc),
-        run_type=run_type,
-        query_name=query_name,
+        run_type="weekly",
+        query_name="backfill",
     )
 
     _pull_pages_to_ndjson(
@@ -288,6 +284,10 @@ def backfill(
 def main() -> None:
     args = parse_args()
 
+    if not api_base_url:
+        raise RuntimeError("API_BASE_URL is empty. Set it in environment/.env")
+
+
     if args.command == 'pull':
         if args.since:
             since_dt = datetime.fromisoformat(args.since)
@@ -304,9 +304,6 @@ def main() -> None:
             since=since_dt,
             page_size=args.page_size,
             max_pages=args.max_pages,
-            snapshot_id=args.snapshot_id,
-            run_type=args.run_type,
-            query_name=args.query_name,
             out_path=args.out,
         )
     
@@ -315,11 +312,25 @@ def main() -> None:
             month=args.month,
             page_size = args.page_size,
             max_pages=args.max_pages,
-            snapshot_id=args.snapshot_id,
-            run_type=args.run_type,
-            query_name=args.query_name,
             out_path=args.out,
         )
+
+    
+    out_path = Path(args.out)
+    size = out_path.stat().st_size if out_path.exists() else 0
+
+    if args.command == "backfill" and size == 0:
+        raise RuntimeError(f"Backfill returned no data: {out_path}")
+    elif size == 0:
+        print(f"[bq] skipped load (no data): {out_path}")
+        return
+    
+    if not args.load_to_bq:
+        print(f"[bq] skipped load (pull only): command={args.command} out={out_path}")
+        return
+    
+    rows = load_jsonl_to_bq(out_path)
+    print(f"[bq] loaded {rows} rows from {out_path}")
 
 if __name__ == "__main__":
     main()
