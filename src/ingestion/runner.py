@@ -12,6 +12,7 @@ from .socrata_models import TrafficIncidentRow
 from .mappers import IngestionMeta, to_bronze_row
 from ..utils.time_utils import month_bounds
 from ..storage.bq_loader import load_jsonl_to_bq
+from ..utils.make_snapshot_id import make_snapshot_id
 
 load_dotenv()
 
@@ -208,7 +209,10 @@ def incremental(
         max_pages: int,
         out_path: str,
 ) -> None:
-    snapshot_id = str(uuid.uuid4())
+    # snapshot_id = str(uuid.uuid4())
+    run_type = "daily"
+    query_name = "incremental"
+    snapshot_id = make_snapshot_id(run_type, query_name)
 
     since_str = _iso_z(since)
 
@@ -221,8 +225,8 @@ def incremental(
     meta = IngestionMeta(
         snapshot_id=snapshot_id,
         snapshot_ts=datetime.now(timezone.utc),
-        run_type="daily",
-        query_name="incremental",
+        run_type=run_type,
+        query_name=query_name,
     )
 
     new_max = _pull_pages_to_ndjson(
@@ -248,7 +252,11 @@ def backfill(
         max_pages: int,
         out_path: str,
 ) -> None:
-    snapshot_id = str(uuid.uuid4())
+    
+    run_type = "weekly"
+    query_name = "backfill"
+    snapshot_id = make_snapshot_id(run_type, query_name)
+
 
     start_dt, end_dt = month_bounds(month)
     start_date = _iso_floating(start_dt)
@@ -264,8 +272,8 @@ def backfill(
     meta = IngestionMeta(
         snapshot_id=snapshot_id,
         snapshot_ts=datetime.now(timezone.utc),
-        run_type="weekly",
-        query_name="backfill",
+        run_type=run_type,
+        query_name=query_name,
     )
 
     _pull_pages_to_ndjson(
