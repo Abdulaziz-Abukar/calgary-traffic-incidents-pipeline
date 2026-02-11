@@ -7,16 +7,18 @@ from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 
-from .socrata_models import TrafficIncidentRow
-from .mappers import IngestionMeta, to_bronze_row
+from src.ingestion.socrata_models import TrafficIncidentRow
+from src.ingestion.mappers import IngestionMeta, to_bronze_row
 from src.utils.time_utils import month_bounds
 from src.storage.bq_loader import load_jsonl_to_bq
+from src.storage.bq_silver import run_silver_merge
 from src.utils.make_snapshot_id import make_snapshot_id
+from src.common.exceptions import require_env
 
 load_dotenv()
 
-api_base_url = os.getenv('API_BASE_URL', '')
-app_token = os.getenv('APP_TOKEN', '')
+API_BASE_URL = require_env("API_BASE_URL")
+APP_TOKEN = require_env("APP_TOKEN")
 
 STATE_DIR = 'state'
 WATERMARK_PATH = os.path.join(STATE_DIR, "watermark.json")
@@ -39,6 +41,7 @@ def parse_args() -> argparse.Namespace:
     incremental.add_argument('--max-pages', type=int, required=True)
     incremental.add_argument('--out', required=True)
     incremental.add_argument('--load-to-bq', action="store_true")
+    incremental.add_argument('--run-silver-merge', action='store_true')
 
     
     # Backfill pulls
@@ -49,6 +52,7 @@ def parse_args() -> argparse.Namespace:
     backfill.add_argument('--max-pages', type=int, required=True)
     backfill.add_argument('--out', required=True)
     backfill.add_argument('--load-to-bq', action="store_true")
+    backfill.add_argument('--run-silver-merge', action='store_true')
 
     return parser.parse_args()
 
@@ -58,12 +62,12 @@ def parse_args() -> argparse.Namespace:
 # -----------------------------------------------------
 
 def _build_headers() -> dict:
-    if not api_base_url:
+    if not API_BASE_URL:
         raise ValueError('API_BASE_URL is empty. Set it in environment/.env')
     
     headers = {'Content-Type': 'application/json'}
-    if app_token:
-        headers['X-App-Token'] = app_token
+    if APP_TOKEN:
+        headers['X-App-Token'] = APP_TOKEN
     return headers
 
 def _iso_z(dt: datetime) -> str:
@@ -133,7 +137,7 @@ def _pull_pages_to_ndjson(
                 "page": {"pageNumber": page_count + 1, "pageSize": page_size},
             }
 
-            response = requests.post(api_base_url, headers=headers, json=body, timeout=30)
+            response = requests.post(API_BASE_URL, headers=headers, json=body, timeout=30)
             if response.status_code >= 400:
                 print("STATUS:", response.status_code)
                 print("RESPONSE:", response.text)
@@ -207,7 +211,7 @@ def incremental(
         page_size: int,
         max_pages: int,
         out_path: str,
-) -> None:
+) -> str:
     # snapshot_id = str(uuid.uuid4())
     run_type = "daily"
     query_name = "incremental"
@@ -242,6 +246,8 @@ def incremental(
         print(f"[watermark] updated to { _iso_z(new_max) }")
     else:
         print("[watermark] no rows returned; watermark unchanged")
+    
+    return snapshot_id
 
 
 def backfill(
@@ -250,7 +256,7 @@ def backfill(
         page_size: int,
         max_pages: int,
         out_path: str,
-) -> None:
+) -> str:
     
     run_type = "weekly"
     query_name = "backfill"
@@ -283,6 +289,8 @@ def backfill(
         out_path=out_path,
     )
 
+    return snapshot_id
+
 
 # -----------------------------------------------------
 # main
@@ -291,9 +299,13 @@ def backfill(
 def main() -> None:
     args = parse_args()
 
-    if not api_base_url:
+    if not API_BASE_URL:
         raise RuntimeError("API_BASE_URL is empty. Set it in environment/.env")
-
+    
+    if args.run_silver_merge and not args.load_to_bq:
+        raise ValueError("--run-silver-merge requires --load-to-bq")
+    
+    snapshot_id = None
 
     if args.command == 'pull':
         if args.since:
@@ -307,7 +319,7 @@ def main() -> None:
             if since_dt is None:
                 raise ValueError("No --since provided and no state/watermark.json found.")
         
-        incremental(
+        snapshot_id = incremental(
             since=since_dt,
             page_size=args.page_size,
             max_pages=args.max_pages,
@@ -315,7 +327,7 @@ def main() -> None:
         )
     
     elif args.command == "backfill":
-        backfill(
+        snapshot_id = backfill(
             month=args.month,
             page_size = args.page_size,
             max_pages=args.max_pages,
@@ -338,6 +350,13 @@ def main() -> None:
     
     rows = load_jsonl_to_bq(out_path)
     print(f"[bq] loaded {rows} rows from {out_path}")
+
+    if  args.run_silver_merge:
+        if snapshot_id is None:
+            raise RuntimeError("snapshot_id was not set; cannot run silver merge")
+        
+        job_id = run_silver_merge(snapshot_id)
+        print(f"[silver] merged snapshot_id={snapshot_id} job_id={job_id}")
 
 if __name__ == "__main__":
     main()
