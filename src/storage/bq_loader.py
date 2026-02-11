@@ -4,8 +4,15 @@ import argparse
 
 from dotenv import load_dotenv
 from google.cloud import bigquery
-from google.api_core.exceptions import GoogleAPIError, NotFound
+from google.api_core.exceptions import GoogleAPIError
+from src.storage.exceptions import (
+    make_bq_client,
+    assert_dataset_access,
+    assert_table_access
+)
 
+from src.storage.bq_jobs import assert_job_succeeded
+from src.common.exceptions import require_env
 
 
 load_dotenv()
@@ -24,12 +31,12 @@ def load_jsonl_to_bq(jsonl_path: str | Path) -> int | None:
     
 
     # --------- Config ---------
-    GCP_PROJECT_ID = os.getenv('GCP_PROJECT_ID')
-    if not GCP_PROJECT_ID:
-        raise RuntimeError("GCP_PROJECT_ID is not set in environment variables.")
+    GCP_PROJECT_ID = require_env("GCP_PROJECT_ID")
+    BRONZE_DATASET_ID = require_env("BRONZE_DATASET_ID")
+    BRONZE_TABLE_ID = require_env("BRONZE_TABLE_ID")
 
-    table_id = f"{GCP_PROJECT_ID}.traffic_bronze.traffic_incidents_raw"
-    dataset_id = f"{GCP_PROJECT_ID}.traffic_bronze"
+    table_id = f"{GCP_PROJECT_ID}.{BRONZE_DATASET_ID}.{BRONZE_TABLE_ID}"
+    dataset_id = f"{GCP_PROJECT_ID}.{BRONZE_DATASET_ID}"
 
     job_config = bigquery.LoadJobConfig(
         source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
@@ -63,28 +70,13 @@ def load_jsonl_to_bq(jsonl_path: str | Path) -> int | None:
     )
 
     # --------- Client ---------
-    try:
-        client = bigquery.Client()
-    except GoogleAPIError as e:
-        raise RuntimeError("Failed to create BigQuery client") from e
+    client = make_bq_client()
 
 
     #--------- fail fast: dataset/table existence/access ---------
 
-    try:
-        client.get_dataset(dataset_id)
-    except NotFound as e:
-        raise RuntimeError(f"Dataset not found: {dataset_id}") from e
-    except GoogleAPIError as e:
-        raise RuntimeError(f"Cannot access dataset: {dataset_id}") from e
-    
-
-    try:
-        client.get_table(table_id)
-    except NotFound as e:
-        raise RuntimeError(f"Table not found: {table_id}") from e
-    except GoogleAPIError as e:
-        raise RuntimeError(f"Cannot access table: {table_id}") from e
+    assert_dataset_access(client, dataset_id)
+    assert_table_access(client, table_id)
     
     # --------- Submit + Wait ---------
     try:
@@ -93,12 +85,15 @@ def load_jsonl_to_bq(jsonl_path: str | Path) -> int | None:
         job.result()
     except GoogleAPIError as e:
         raise RuntimeError(f"BigQuery load failed for {table_id}") from e
-    
-    if job.error_result:
-        raise RuntimeError(f"BigQuery job error_result: {job.error_result}")
 
-    if job.errors:
-        raise RuntimeError(f"BigQuery load completed with errors: {job.errors}")
+
+    assert_job_succeeded(
+        job,
+        context={
+            "layer": "raw",
+            "table": table_id,
+        },
+    )
     
     print(f"JobID {job.job_id}")
     print(f"Loaded {job.output_rows} rows into {table_id}")
