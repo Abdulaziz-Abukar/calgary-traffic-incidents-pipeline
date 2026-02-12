@@ -1,0 +1,18 @@
+version: 2
+
+models:
+  - name: stg_traffic_incidents_raw
+    columns:
+      - name: snapshot_id
+        tests: [not_null]
+      - name: incident_id
+        tests: [not_null]
+      - name: source_updated_at
+        tests: [not_null]
+
+  - name: stg_incident_current
+    columns:
+      - name: incident_id
+        tests: [not_null, unique]
+      - name: source_updated_at
+        tests: [not_null]

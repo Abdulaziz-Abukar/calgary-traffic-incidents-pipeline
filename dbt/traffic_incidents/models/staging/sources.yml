@@ -1,0 +1,16 @@
+version 2:
+
+sources:
+  - name: traffic_bronze
+    database: calgary-traffic-incident
+    schema: traffic_bronze
+    tables:
+      - name: traffic_incidents_raw
+        description: "Append-only bronze table loaded from Socrata traffic incidents API"
+
+  - name: "traffic_silver"
+    database: "calgary-traffic-incident"
+    schema: "traffic_silver"
+    tables:
+      - name: incident_current
+        description: "Current-state (latest) incident table maintained via MERGE from bronze"
