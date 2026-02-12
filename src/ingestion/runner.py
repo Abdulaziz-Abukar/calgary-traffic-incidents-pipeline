@@ -360,3 +360,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# pull command -> python -m src.ingestion.runner pull --since YYYY-MM-DDT00:00:00Z --page-size 1000 --max-pages 10 --out data/raw/incremental/(filename).jsonl --load-to-bq --run-silver-merge
+# backfill command -> python -m src.ingestion.runner backfill --month YYYY-MM --page-size 1000 --max-pages 10 --out data/raw/backfill/(filename).jsonl --load-to-bq --run-silver-merge
