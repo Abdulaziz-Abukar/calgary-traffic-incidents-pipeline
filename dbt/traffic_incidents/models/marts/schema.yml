@@ -1,0 +1,146 @@
+version: 2
+
+models:
+  - name: dim_incident
+    description: >
+      Current incident dimension (latest known descriptive attributes per incident_id).
+      Used as a fallback when SCD2 does not contain a matching historical version.
+    columns:
+      - name: incident_id
+        description: Natural key for the incident from the Calgary open data source.
+        tests: [not_null, unique]
+
+  - name: dim_incident_history
+    description: >
+      SCD Type 2 dimension for incident attributes derived from bronze snapshots.
+      Version boundaries use source_updated_at. Each row is effective for
+      [valid_from, valid_to) and is_current indicates the active version.
+    columns:
+      - name: incident_id
+        description: Natural key for the incident from the Calgary open data source.
+        tests: [not_null]
+      - name: incident_info
+        description: Incident label/category as reported by the source.
+      - name: description
+        description: Incident description text as reported by the source.
+      - name: valid_from
+        description: Effective start timestamp for this version (from source_updated_at).
+        tests: [not_null]
+      - name: valid_to
+        description: Effective end timestamp for this version (exclusive). NULL if current.
+      - name: is_current
+        description: True if this is the current active version (valid_to is NULL).
+        tests: [not_null]
+
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - incident_id
+              - valid_from
+
+  - name: dim_location
+    description: >
+      Location dimension based on quadrant + rounded latitude/longitude.
+      location_key = quadrant * round(latitude, 3) * round(longitude, 3)
+    columns:
+      - name: location_key
+        description: Location surrogate key derived from quadrant and rounded lat/lon.
+        tests: [not_null, unique]
+      - name: quadrant
+        description: City quadrant for the incident location.
+        tests:
+          - not_null
+          - accepted_values:
+              values: ["NW", "NE", "SW", "SE"]
+      - name: latitude
+        description: Latitude rounded to 3 decimals (if materialized in the dimension).
+      - name: longitude
+        description: Longitude rounded to 3 decimals (if materialized in the dimension).
+
+  - name: fact_incident
+    description: >
+      Current-state fact table (1 row per incident_id) representing the latest known
+      incident state. Sourced from silver/current truth and joined to dim_location.
+    columns:
+      - name: incident_id
+        description: Incident identifier (grain key).
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_incident')
+              field: incident_id
+      - name: location_key
+        description: Foreign key to dim_location.
+      - name: source_updated_at
+        description: Last updated timestamp from the source system.
+      - name: loaded_at
+        description: Timestamp when this record was loaded/produced by the pipeline.
+
+  - name: fact_incident_snapshot
+    description: >
+      Snapshot fact table capturing observed incident states at ingestion time.
+      Grain: (snapshot_id, incident_id).
+      Used for historical analysis and as-of joins to SCD2 dimensions.
+    columns:
+      - name: snapshot_id
+        description: Unique identifier for an ingestion snapshot run.
+        tests: [not_null]
+      - name: snapshot_ts
+        description: Timestamp when the pipeline ingested/pulled this snapshot.
+      - name: incident_id
+        description: Incident identifier from the source.
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_incident')
+              field: incident_id
+      - name: location_key
+        description: Foreign key to dim_location for the incident location at snapshot time.
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_location')
+              field: location_key
+      - name: source_updated_at
+        description: Source-reported last updated timestamp for the incident at this snapshot.
+      - name: run_type
+        description: Ingestion run type (incremental/backfill) recorded by the pipeline.
+      - name: query_name
+        description: Named query window used by ingestion for auditability/backfills.
+
+  - name: fact_incident_snapshot_enriched
+    description: >
+      Snapshot fact enriched with incident attributes as-of snapshot_ts via SCD2 join to
+      dim_incident_history, with fallback to dim_incident when no SCD2 match exists.
+      Grain: (snapshot_id, incident_id).
+    columns:
+      - name: snapshot_id
+        description: Unique identifier for an ingestion snapshot run.
+        tests: [not_null]
+      - name: incident_id
+        description: Incident identifier from the source.
+        tests: [not_null]
+      - name: snapshot_ts
+        description: Timestamp when the pipeline ingested/pulled this snapshot.
+        tests: [not_null]
+      - name: used_current_fallback
+        description: True when no SCD2 version matched and dim_incident values were used.
+        tests: [not_null]
+      - name: incident_info_asof
+        description: Incident label/category as-of snapshot_ts (SCD2 with fallback).
+        tests: [not_null]
+      - name: description_asof
+        description: Incident description as-of snapshot_ts (SCD2 with fallback).
+        tests: [not_null]
+      - name: valid_from
+        description: valid_from of the matched SCD2 row (if included in the model).
+      - name: valid_to
+        description: valid_to of the matched SCD2 row (if included in the model).
+
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - snapshot_id
+              - incident_id
