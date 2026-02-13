@@ -1,0 +1,15 @@
+version: 2
+
+exposures:
+  - name: calgary_traffic_incidents_mart
+    type: dashboard
+    maturity: high
+    description: >
+      Portfolio mart for Calgary traffic incidents featuring snapshot history,
+      SCD Type 2 dimensions, and as-of enriched snapshots.
+    depends_on:
+      - ref('fact_incident_snapshot_enriched')
+      - ref('fact_incident')
+    owner:
+      name: Abdulaziz Abukar
+      email: abdulazizabubakarfaqih@gmail.com
