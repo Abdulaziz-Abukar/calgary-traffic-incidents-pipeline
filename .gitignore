@@ -1,8 +1,16 @@
 .env
 .env.example
+logs
 /dbt/logs
+/dbt/traffic_incidents/logs/dbt.log
+/dbt/traffic_incidents/package-lock.yml
+/dbt/traffic_incidents/profiles.yml
 __pycache__
 data/*
 state/*
 .pytest_cache
 .vscode
+.user.yml
+.tmp_dagster_home_qjya_758
+traffic_orchestrator.egg-info
+.tmp*
