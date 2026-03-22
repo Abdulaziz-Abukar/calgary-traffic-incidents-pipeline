@@ -1,0 +1,11 @@
+traffic_incidents:
+  target: dev
+  outputs:
+    dev:
+      type: bigquery
+      method: service-account
+      project: calgary-traffic-incident
+      dataset: traffic_marts
+      location: US
+      threads: 4
+      keyfile: C:\Users\aziz2\.gcp\calgary-traffic-incident-key.json

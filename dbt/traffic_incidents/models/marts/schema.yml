@@ -144,3 +144,21 @@ models:
             combination_of_columns:
               - snapshot_id
               - incident_id
+
+  - name: pipeline_run_log
+    description: >
+      Operational run log aggregated per ingestion snapshot_id from bronze data.
+      Used for monitoring freshness, volume, and debugging pipeline runs.
+    columns:
+      - name: snapshot_id
+        tests: [not_null, unique]
+      - name: snapshot_ts
+        tests: [not_null]
+      - name: run_type
+        tests: [not_null]
+      - name: query_name
+        tests: [not_null]
+      - name: rows_loaded
+        tests: [not_null]
+      - name: max_source_updated_at
+        tests: [not_null]
