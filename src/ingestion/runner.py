@@ -3,7 +3,7 @@ import argparse
 from pathlib import Path
 import json
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from dotenv import load_dotenv
 
@@ -22,6 +22,9 @@ APP_TOKEN = require_env("APP_TOKEN")
 
 STATE_DIR = 'state'
 WATERMARK_PATH = os.path.join(STATE_DIR, "watermark.json")
+
+# Overlap window for incremental pulls when using >= since
+WATERMARK_OVERLAP_MINUTES = 5
 
 # -----------------------------------------------------
 # CLI
@@ -75,7 +78,7 @@ def _iso_z(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z')
 
 def _iso_floating(dt: datetime) -> str:
-    # No timezone suffic for Socrata floating_timestamp fields
+    # No timezone suffix for Socrata floating_timestamp fields
     return dt.astimezone(timezone.utc).replace(tzinfo=None).isoformat(timespec="milliseconds")
 
 def _base_select() -> str:
@@ -102,7 +105,7 @@ def read_watermark() -> datetime | None:
         return None
     
 def write_watermark(dt: datetime) -> None:
-    """Presist last_source_updated_at in UTC ISO 'Z' format."""
+    """Persist last_source_updated_at in UTC ISO 'Z' format."""
     _ensure_state_dir()
     payload = {"last_source_updated_at": _iso_z(dt)}
     with open(WATERMARK_PATH, 'w', encoding="utf-8") as f:
@@ -116,7 +119,7 @@ def _pull_pages_to_ndjson(
         max_pages: int,
         meta: IngestionMeta,
         out_path: str,
-) -> datetime | None:
+) -> tuple[datetime | None, int]:
     
     headers = _build_headers()
 
@@ -199,7 +202,7 @@ def _pull_pages_to_ndjson(
     print(f"Rows written:                       {total_rows}")
     print(f"Distinct incident_id:               {len(distinct_incidents)}")
 
-    return max_source_updated_at
+    return max_source_updated_at, total_rows
 
 # -----------------------------------------------------
 # Entry Functions
@@ -211,8 +214,7 @@ def incremental(
         page_size: int,
         max_pages: int,
         out_path: str,
-) -> str:
-    # snapshot_id = str(uuid.uuid4())
+) -> tuple[str, datetime | None, int]:
     run_type = "daily"
     query_name = "incremental"
     snapshot_id = make_snapshot_id(run_type, query_name)
@@ -221,7 +223,7 @@ def incremental(
 
     soql = (
         _base_select()
-        + f"WHERE :updated_at > '{since_str}' "
+        + f"WHERE :updated_at >= '{since_str}' "
         + "ORDER BY :updated_at ASC, :id ASC"
     )
 
@@ -232,22 +234,15 @@ def incremental(
         query_name=query_name,
     )
 
-    new_max = _pull_pages_to_ndjson(
+    new_max, rows_written = _pull_pages_to_ndjson(
         soql=soql,
         page_size=page_size,
         max_pages=max_pages,
         meta=meta,
         out_path=out_path,
     )
-
     
-    if new_max is not None:
-        write_watermark(new_max)
-        print(f"[watermark] updated to { _iso_z(new_max) }")
-    else:
-        print("[watermark] no rows returned; watermark unchanged")
-    
-    return snapshot_id
+    return snapshot_id, new_max, rows_written
 
 
 def backfill(
@@ -256,9 +251,9 @@ def backfill(
         page_size: int,
         max_pages: int,
         out_path: str,
-) -> str:
+) -> tuple[str, int]:
     
-    run_type = "weekly"
+    run_type = "monthly"
     query_name = "backfill"
     snapshot_id = make_snapshot_id(run_type, query_name)
 
@@ -281,7 +276,7 @@ def backfill(
         query_name=query_name,
     )
 
-    _pull_pages_to_ndjson(
+    _, rows_written = _pull_pages_to_ndjson(
         soql=soql,
         page_size=page_size,
         max_pages=max_pages,
@@ -289,8 +284,138 @@ def backfill(
         out_path=out_path,
     )
 
-    return snapshot_id
+    return snapshot_id, rows_written
 
+
+def run_pipeline(
+    *,
+    command: str,
+    since: str | datetime | None = None,
+    month: str | None = None,
+    page_size: int,
+    max_pages: int,
+    out: str,
+    load_to_bq: bool,
+    run_silver_merge_flag: bool,
+) -> dict:
+    if not API_BASE_URL:
+        raise RuntimeError("API_BASE_URL is empty. Set it in environment/.env")
+
+    if run_silver_merge_flag and not load_to_bq:
+        raise ValueError("--run-silver-merge requires --load-to-bq")
+
+    snapshot_id: str | None = None
+    new_max: datetime | None = None
+    rows_written: int = 0
+    rows_loaded: int = 0
+    watermark_before: str | None = None
+    watermark_after: str | None = None
+
+    if command == "pull":
+        if since:
+            if isinstance(since, str):
+                since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+            else:
+                since_dt = since
+
+            if since_dt.tzinfo is None:
+                since_dt = since_dt.replace(tzinfo=timezone.utc)
+            else:
+                since_dt = since_dt.astimezone(timezone.utc)
+        else:
+            stored_watermark = read_watermark()
+            if stored_watermark is None:
+                raise ValueError("No --since provided and no state/watermark.json found.")
+            
+            since_dt = stored_watermark - timedelta(minutes=WATERMARK_OVERLAP_MINUTES)
+        
+        watermark_before = _iso_z(since_dt)
+
+        snapshot_id, new_max, rows_written = incremental(
+            since=since_dt,
+            page_size=page_size,
+            max_pages=max_pages,
+            out_path=out,
+        )
+
+    elif command == "backfill":
+        if not month:
+            raise ValueError("backfill requires month in YYYY-MM format")
+
+        snapshot_id, rows_written = backfill(
+            month=month,
+            page_size=page_size,
+            max_pages=max_pages,
+            out_path=out,
+        )
+    
+    else:
+        raise ValueError(f"Unsupported command: {command}")
+    
+    out_path = Path(out)
+    size = out_path.stat().st_size if out_path.exists() else 0
+
+    if command == "backfill" and size == 0:
+        raise RuntimeError(f"Backfill returned no data: {out_path}")
+    elif size == 0:
+        return {
+            "command": command,
+            "snapshot_id": snapshot_id,
+            "rows_written": 0,
+            "rows_loaded": 0,
+            "output_path": str(out_path),
+            "watermark_before": watermark_before,
+            "watermark_after": None,
+            "silver_merge_job_id": None,
+            "loaded_to_bq": False,
+            "silver_merge_ran": False,
+            "message": f"[bq] skipped load (no data): {out_path}"
+        }
+
+    silver_job_id: str | None = None
+
+    if not load_to_bq:
+        return {
+            "command": command,
+            "snapshot_id": snapshot_id,
+            "rows_written": rows_written,
+            "rows_loaded": 0,
+            "output_path": str(out_path),
+            "watermark_before": watermark_before,
+            "watermark_after": _iso_z(new_max) if new_max else None,
+            "silver_merge_job_id": None,
+            "loaded_to_bq": False,
+            "silver_merge_ran": False,
+            "message": f"[bq] skipped load (pull only): command={command} out={out_path}"
+        }
+    
+    rows = load_jsonl_to_bq(out_path)
+    rows_loaded = rows or 0
+
+    if run_silver_merge_flag:
+        if snapshot_id is None:
+            raise RuntimeError("snapshot_id was not set; cannot run silver merge")
+        
+        silver_job_id = run_silver_merge(snapshot_id)
+    
+    if command == "pull":
+        if new_max is not None:
+            write_watermark(new_max)
+            watermark_after = _iso_z(new_max)
+    
+    return {
+        "command": command,
+        "snapshot_id": snapshot_id,
+        "rows_written": rows_written,
+        "rows_loaded": rows_loaded,
+        "output_path": str(out_path),
+        "watermark_before": watermark_before,
+        "watermark_after": watermark_after,
+        "silver_merge_job_id": silver_job_id,
+        "loaded_to_bq": True,
+        "silver_merge_ran": bool(run_silver_merge_flag),
+        "message": "Pipeline completed successfully"
+    }
 
 # -----------------------------------------------------
 # main
@@ -299,64 +424,18 @@ def backfill(
 def main() -> None:
     args = parse_args()
 
-    if not API_BASE_URL:
-        raise RuntimeError("API_BASE_URL is empty. Set it in environment/.env")
-    
-    if args.run_silver_merge and not args.load_to_bq:
-        raise ValueError("--run-silver-merge requires --load-to-bq")
-    
-    snapshot_id = None
+    result = run_pipeline(
+        command=args.command,
+        since=getattr(args, "since", None),
+        month=getattr(args, "month", None),
+        page_size=args.page_size,
+        max_pages=args.max_pages,
+        out=args.out,
+        load_to_bq=args.load_to_bq,
+        run_silver_merge_flag=args.run_silver_merge,
+    )
 
-    if args.command == 'pull':
-        if args.since:
-            since_dt = datetime.fromisoformat(args.since)
-            if since_dt.tzinfo is None:
-                since_dt = since_dt.replace(tzinfo=timezone.utc)
-            else:
-                since_dt = since_dt.astimezone(timezone.utc)
-        else:
-            since_dt = read_watermark()
-            if since_dt is None:
-                raise ValueError("No --since provided and no state/watermark.json found.")
-        
-        snapshot_id = incremental(
-            since=since_dt,
-            page_size=args.page_size,
-            max_pages=args.max_pages,
-            out_path=args.out,
-        )
-    
-    elif args.command == "backfill":
-        snapshot_id = backfill(
-            month=args.month,
-            page_size = args.page_size,
-            max_pages=args.max_pages,
-            out_path=args.out,
-        )
-
-    
-    out_path = Path(args.out)
-    size = out_path.stat().st_size if out_path.exists() else 0
-
-    if args.command == "backfill" and size == 0:
-        raise RuntimeError(f"Backfill returned no data: {out_path}")
-    elif size == 0:
-        print(f"[bq] skipped load (no data): {out_path}")
-        return
-    
-    if not args.load_to_bq:
-        print(f"[bq] skipped load (pull only): command={args.command} out={out_path}")
-        return
-    
-    rows = load_jsonl_to_bq(out_path)
-    print(f"[bq] loaded {rows} rows from {out_path}")
-
-    if  args.run_silver_merge:
-        if snapshot_id is None:
-            raise RuntimeError("snapshot_id was not set; cannot run silver merge")
-        
-        job_id = run_silver_merge(snapshot_id)
-        print(f"[silver] merged snapshot_id={snapshot_id} job_id={job_id}")
+    print(json.dumps(result, indent=2))
 
 if __name__ == "__main__":
     main()
